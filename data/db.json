@@ -1,0 +1,19 @@
+{
+  "users": [
+    {
+      "id": 1,
+      "name": "Administrador VIZORA",
+      "email": "admin@vizora.local",
+      "passwordHash": "462eec340e6a42452da32571240c9b0ef08d7799ac0760b3e86e14e6b5e4dd8f"
+    }
+  ],
+  "clients": [],
+  "briefings": [],
+  "quotes": [],
+  "contracts": [],
+  "payments": [],
+  "projects": [],
+  "followups": [],
+  "activities": [],
+  "sessions": []
+}
