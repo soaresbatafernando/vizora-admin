@@ -77,6 +77,25 @@ function mapFollowup(r){return {...r,clientId:r.client_id,nextAction:r.next_acti
 function mapActivity(r){return {...r,clientId:r.client_id,created:r.created_at,time:r.created_at};}
 function mapDocument(r){return {...r,clientId:r.client_id,quoteId:r.quote_id,contractId:r.contract_id,projectId:r.project_id,created:r.created_at};}
 
+// Financials are derived from the real contracts/payments so the dashboard cannot
+// become stale when test data or manual changes exist in the clients table.
+function latestContractValue(contracts,clientId){
+  const list=(contracts||[]).filter(x=>Number(x.clientId)===Number(clientId));
+  if(!list.length)return 0;
+  list.sort((a,b)=>new Date(b.created||0)-new Date(a.created||0));
+  return Number(list[0].value||0);
+}
+function paidForClient(payments,clientId){
+  return (payments||[]).filter(x=>Number(x.clientId)===Number(clientId)).reduce((sum,p)=>sum+Number(p.amount||0),0);
+}
+function applyFinancials(clients,contracts,payments){
+  return (clients||[]).map(c=>{
+    const contracted=latestContractValue(contracts,c.id)||Number(c.contracted||0);
+    const paid=paidForClient(payments,c.id);
+    return {...c,contracted,paid};
+  });
+}
+
 async function all(sb,table,mapper){const r=await sb.from(table).select("*").order("created_at",{ascending:false});if(r.error)throw r.error;return (r.data||[]).map(mapper);}
 
 app.post("/api/briefing",async(req,res)=>{
@@ -96,8 +115,10 @@ app.get("/api/bootstrap",auth,async(req,res)=>{
     const [clients,briefings,quotes,contracts,payments,projects,followups,activities,documents]=await Promise.all([
       all(req.sb,"clients",mapClient),all(req.sb,"briefings",mapBriefing),all(req.sb,"quotes",mapQuote),all(req.sb,"contracts",mapContract),all(req.sb,"payments",mapPayment),all(req.sb,"projects",mapProject),all(req.sb,"followups",mapFollowup),all(req.sb,"activities",mapActivity),all(req.sb,"documents",mapDocument)
     ]);
-    const contracted=clients.reduce((a,c)=>a+Number(c.contracted||0),0),received=clients.reduce((a,c)=>a+Number(c.paid||0),0);
-    res.json({ok:true,users:[],clients,briefings,quotes,contracts,payments,projects,followups,activities,documents,sessions:[],catalog,metrics:{totalClients:clients.length,leads:clients.filter(c=>!["Cliente ativo","Projeto concluído","Perdido"].includes(c.status)).length,activeProjects:projects.filter(p=>p.status!=="Concluído").length,contracted,received,balance:Math.max(0,contracted-received)}});
+    const financialClients=applyFinancials(clients,contracts,payments);
+    const contracted=financialClients.reduce((a,c)=>a+Number(c.contracted||0),0);
+    const received=payments.reduce((a,p)=>a+Number(p.amount||0),0);
+    res.json({ok:true,users:[],clients:financialClients,briefings,quotes,contracts,payments,projects,followups,activities,documents,sessions:[],catalog,metrics:{totalClients:financialClients.length,leads:financialClients.filter(c=>!["Cliente ativo","Projeto concluído","Perdido"].includes(c.status)).length,activeProjects:projects.filter(p=>p.status!=="Concluído").length,contracted,received,balance:Math.max(0,contracted-received)}});
   }catch(e){res.status(500).json({ok:false,message:e.message});}
 });
 
@@ -161,7 +182,9 @@ app.post("/api/contracts",auth,async(req,res)=>{
 
 app.patch("/api/contracts/:id",auth,async(req,res)=>{
   const b=req.body,row={};const map={service:"service",plan:"plan",value:"value",duration:"duration",scope:"scope",responsibilities:"responsibilities",notes:"notes"};Object.keys(map).forEach(k=>{if(b[k]!==undefined)row[map[k]]=b[k]});row.updated_at=new Date().toISOString();
-  const {data,error}=await req.sb.from("contracts").update(row).eq("id",Number(req.params.id)).select("*").single();if(error)return res.status(400).json({ok:false,message:error.message});res.json({ok:true,contract:mapContract(data)});
+  const {data,error}=await req.sb.from("contracts").update(row).eq("id",Number(req.params.id)).select("*").single();if(error)return res.status(400).json({ok:false,message:error.message});
+  if(row.value!==undefined){await req.sb.from("clients").update({contracted:Number(row.value||0),updated_at:new Date().toISOString()}).eq("id",data.client_id);}
+  res.json({ok:true,contract:mapContract(data)});
 });
 app.post("/api/contracts/:id/sign",auth,async(req,res)=>{
   const id=Number(req.params.id);const {data:c,error}=await req.sb.from("contracts").update({status:"Assinado",client_signed:clean(req.body.clientSigned)||null,vizora_signed:clean(req.body.vizoraSigned)||null,signed_at:new Date().toISOString(),updated_at:new Date().toISOString()}).eq("id",id).select("*").single();
@@ -200,9 +223,13 @@ app.post("/api/payments",auth,async(req,res)=>{
   if(!c||amount<=0)return res.status(400).json({ok:false,message:"Cliente e valor são obrigatórios."});
   const row={client_id:clientId,contract_id:Number(req.body.contractId)||null,amount,date:clean(req.body.date)||new Date().toISOString().slice(0,10),method:clean(req.body.method)||"Outro",reference:clean(req.body.reference)||null,observation:clean(req.body.observation)||null};
   const {data:p,error}=await req.sb.from("payments").insert(row).select("*").single();if(error)return res.status(400).json({ok:false,message:error.message});
-  const paid=Number(c.paid||0)+amount,status=Number(c.contracted||0)>0&&paid>=Number(c.contracted||0)?"Cliente ativo":"Pagamento parcial";
-  await req.sb.from("clients").update({paid,status,updated_at:new Date().toISOString()}).eq("id",clientId);await req.sb.from("activities").insert({client_id:clientId,type:"payment",text:"Pagamento registado",detail:`${c.name} — ${amount.toLocaleString("pt-MZ")} MZN`});
-  res.json({ok:true,payment:mapPayment(p),balance:Math.max(0,Number(c.contracted||0)-paid)});
+  const {data:allPaid,error:pe}=await req.sb.from("payments").select("amount").eq("client_id",clientId);if(pe)return res.status(400).json({ok:false,message:pe.message});
+  const {data:contracts}=await req.sb.from("contracts").select("value,created_at").eq("client_id",clientId).order("created_at",{ascending:false}).limit(1);
+  const contracted=Number(contracts?.[0]?.value??c.contracted??0);
+  const paid=(allPaid||[]).reduce((sum,r)=>sum+Number(r.amount||0),0);
+  const status=contracted>0&&paid>=contracted?"Cliente ativo":(paid>0?"Pagamento parcial":"Aguardando pagamento");
+  await req.sb.from("clients").update({contracted,paid,status,updated_at:new Date().toISOString()}).eq("id",clientId);await req.sb.from("activities").insert({client_id:clientId,type:"payment",text:"Pagamento registado",detail:`${c.name} — ${amount.toLocaleString("pt-MZ")} MZN`});
+  res.json({ok:true,payment:mapPayment(p),balance:Math.max(0,contracted-paid)});
 });
 
 app.delete("/api/payments/:id",auth,async(req,res)=>{
@@ -217,10 +244,11 @@ app.delete("/api/payments/:id",auth,async(req,res)=>{
     const {data:remaining,error:re}=await req.sb.from("payments").select("amount").eq("client_id",p.client_id);
     if(re)return res.status(400).json({ok:false,message:re.message});
     const paid=(remaining||[]).reduce((sum,row)=>sum+Number(row.amount||0),0);
-    const contracted=Number(c.contracted||0);
+    const {data:contracts}=await req.sb.from("contracts").select("value,created_at").eq("client_id",p.client_id).order("created_at",{ascending:false}).limit(1);
+    const contracted=Number(contracts?.[0]?.value??c.contracted??0);
     let status=c.status;
     if(contracted>0) status=paid>=contracted?"Cliente ativo":(paid>0?"Pagamento parcial":"Aguardando pagamento");
-    await req.sb.from("clients").update({paid,status,updated_at:new Date().toISOString()}).eq("id",p.client_id);
+    await req.sb.from("clients").update({contracted,paid,status,updated_at:new Date().toISOString()}).eq("id",p.client_id);
   }
   res.json({ok:true,message:"Pagamento eliminado e financeiro recalculado."});
 });
